@@ -1,0 +1,492 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "Name": {
+      "type": "string",
+      "defaultValue": "get-rg-logic",
+      "metadata": {
+        "description": "Name of the Logic App."
+      }
+    },
+    "RecurrenceFrequency": {
+      "type": "string",
+      "defaultValue": "Hour"
+    },
+    "RecurrenceInterval": {
+      "type": "int",
+      "defaultValue": 1
+    },
+    "StorageAccount": {
+      "type": "string",
+      "defaultValue": "gcstorage",
+      "metadata": {
+        "description": "The name of your storage account"
+      }
+    },
+    "CloudBrokerage": {
+      "type": "string",
+      "defaultValue": "stefan@stefanroth.net"
+    }
+  },
+  "variables": {
+    "get_subscriptions-URI": "https://management.azure.com/subscriptions?api-version=2019-06-01",
+    "get_resource_groups-URI": "https://management.azure.com/subscriptions/@{items('Loop_Subscriptions')?['subscriptionId']}/resourcegroups?api-version=2019-05-10&%24filter=tagname%20eq%20%27creation%20date%27",
+    "azuretables_connection_name": "[concat(parameters('storageaccount'),'-connection')]",
+    "logic_app_location": "[resourceGroup().location]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2016-06-01",
+      "name": "[parameters('Name')]",
+      "location": "[variables('logic_app_location')]",
+	"identity": { 
+      "type": "SystemAssigned" 
+   	},
+      "dependsOn": [
+        "[parameters('storageaccount')]",
+        "[resourceId('Microsoft.Web/connections', variables('azuretables_connection_name'))]"
+      ],
+      "properties": {
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "$connections": {
+              "defaultValue": {},
+              "type": "Object"
+            }
+          },
+          "triggers": {
+            "Recurrence": {
+              "recurrence": {
+                "frequency": "[parameters('RecurrenceFrequency')]",
+                "interval": "[parameters('RecurrenceInterval')]"
+              },
+              "type": "Recurrence",
+              "inputs": {}
+            }
+          },
+          "actions": {
+            "Get_Subscriptions": {
+              "runAfter": {
+                "Get_entities": [
+                  "Succeeded"
+                ]
+              },
+              "type": "Http",
+              "inputs": {
+                "authentication": {
+                  "type": "ManagedServiceIdentity"
+                },
+                "headers": {
+                  "content-type": "application/json"
+                },
+                "method": "GET",
+                "uri": "[variables('get_subscriptions-URI')]"
+              }
+            },
+            "Get_entities": {
+              "runAfter": {
+                "Initialize_variable": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": {
+                    "name": "@parameters('$connections')['azuretables']['connectionId']"
+                  }
+                },
+                "method": "get",
+                "path": "/Tables/@{encodeURIComponent('garbagecollector')}/entities"
+              }
+            },
+            "Initialize_variable": {
+              "runAfter": {},
+              "type": "InitializeVariable",
+              "inputs": {
+                "variables": [
+                  {
+                    "name": "CloudBrokerage",
+                    "type": "String",
+                    "value": "[parameters('cloudbrokerage')]"
+                  }
+                ]
+              }
+            },
+            "Loop_Subscriptions": {
+              "foreach": "@body('Parse_''Get_Subscriptions''_Result')?['value']",
+              "actions": {
+                "Get_Resource_Groups": {
+                  "runAfter": {},
+                  "type": "Http",
+                  "inputs": {
+                    "authentication": {
+                      "type": "ManagedServiceIdentity"
+                    },
+                    "headers": {
+                      "content-type": "application/json"
+                    },
+                    "method": "GET",
+                    "uri": "[variables('get_resource_groups-URI')]"
+                  }
+                },
+                "Loop_Resource_Groups": {
+                  "foreach": "@body('Parse_''Get_Resource_Groups''_Result')?['value']",
+                  "actions": {
+                    "Condition": {
+                      "actions": {
+                        "Update_Properties": {
+                          "runAfter": {},
+                          "type": "ApiConnection",
+                          "inputs": {
+                            "body": {
+                              //"CreationDate": "@{items('Loop_Resource_Groups')?['tags']?['creation date']}",
+                              "LastCheckedDate": "@{utcNow()}",
+                              "Name": "@{items('Loop_Resource_Groups')?['name']}",
+                              "Owner": "@{items('Loop_Resource_Groups')?['tags']?['it owner']};@{variables('CloudBrokerage')}",
+                              "Autodelete": "@{items('Loop_Resource_Groups')?['tags']?['autodelete']}"
+                            },
+                            "host": {
+                              "connection": {
+                                "name": "@parameters('$connections')['azuretables']['connectionId']"
+                              }
+                            },
+                            "method": "patch",
+                            "path": "/Tables/@{encodeURIComponent('garbagecollector')}/entities(PartitionKey='@{encodeURIComponent(items('Loop_Subscriptions')?['subscriptionId'])}',RowKey='@{encodeURIComponent(items('Loop_Resource_Groups')?['name'])}')"
+                          }
+                        }
+                      },
+                      "runAfter": {
+                        "Get_entity": [
+                          "Succeeded",
+                          "Failed"
+                        ]
+                      },
+                      "else": {
+                        "actions": {
+                          "Insert_Record": {
+                            "runAfter": {},
+                            "type": "ApiConnection",
+                            "inputs": {
+                              "body": {
+                                "CreationDate": "@{items('Loop_Resource_Groups')?['tags']?['creation date']}",
+                                "DeclineCount": 0,
+                                "Deleted": false,
+                                "DeletionDate": "1900-01-01T00:00:00Z",
+                                "LastCheckedDate": "1900-01-01T00:00:00Z",
+                                "Name": "@{items('Loop_Resource_Groups')?['name']}",
+                                "NotificationDate": "1900-01-01T00:00:00Z",
+                                "Owner": "@{items('Loop_Resource_Groups')?['tags']?['it owner']};@{variables('CloudBrokerage')}",
+                                "Autodelete": "true"
+                              },
+                              "host": {
+                                "connection": {
+                                  "name": "@parameters('$connections')['azuretables']['connectionId']"
+                                }
+                              },
+                              "method": "patch",
+                              "path": "/Tables/@{encodeURIComponent('garbagecollector')}/entities(PartitionKey='@{encodeURIComponent(items('Loop_Subscriptions')?['subscriptionId'])}',RowKey='@{encodeURIComponent(items('Loop_Resource_Groups')?['name'])}')"
+                            }
+                          }
+                        }
+                      },
+                      "expression": {
+                        "and": [
+                          {
+                            "equals": [
+                              "@body('Get_entity')?['RowKey']",
+                              "@items('Loop_Resource_Groups')?['name']"
+                            ]
+                          },
+                          {
+                            "not": {
+                              "equals": [
+                                "@body('Get_entity')?['Deleted']",
+                                true
+                              ]
+                            }
+                          }
+                        ]
+                      },
+                      "type": "If"
+                    },
+                    "Get_entity": {
+                      "runAfter": {},
+                      "type": "ApiConnection",
+                      "inputs": {
+                        "host": {
+                          "connection": {
+                            "name": "@parameters('$connections')['azuretables']['connectionId']"
+                          }
+                        },
+                        "method": "get",
+                        "path": "/Tables/@{encodeURIComponent('garbagecollector')}/entities(PartitionKey='@{encodeURIComponent(items('Loop_Subscriptions')?['subscriptionId'])}',RowKey='@{encodeURIComponent(items('Loop_Resource_Groups')?['name'])}')"
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "Parse_'Get_Resource_Groups'_Result": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "Foreach"
+                },
+                "Parse_'Get_Resource_Groups'_Result": {
+                  "runAfter": {
+                    "Get_Resource_Groups": [
+                      "Succeeded"
+                    ]
+                  },
+                  "type": "ParseJson",
+                  "inputs": {
+                    "content": "@body('Get_Resource_Groups')",
+                    "schema": {
+                      "properties": {
+                        "value": {
+                          "items": {
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "location": {
+                                "type": "string"
+                              },
+                              "name": {
+                                "type": "string"
+                              },
+                              "properties": {
+                                "properties": {
+                                  "provisioningState": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object"
+                              },
+                              "tags": {
+                                "properties": {
+                                  "creation date": {
+                                    "type": "string"
+                                  },
+                                  "it owner": {
+                                    "type": "string"
+                                  },
+                                  "autodelete": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object"
+                              },
+                              "type": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "id",
+                              "name",
+                              "type",
+                              "location",
+                              "tags",
+                              "properties"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    }
+                  }
+                }
+              },
+              "runAfter": {
+                "Parse_'Get_Subscriptions'_Result": [
+                  "Succeeded"
+                ]
+              },
+              "type": "Foreach"
+            },
+            "Parse_'Get_Subscriptions'_Result": {
+              "runAfter": {
+                "Get_Subscriptions": [
+                  "Succeeded"
+                ]
+              },
+              "type": "ParseJson",
+              "inputs": {
+                "content": "@body('Get_Subscriptions')",
+                "schema": {
+                  "properties": {
+                    "body": {
+                      "properties": {
+                        "count": {
+                          "properties": {
+                            "type": {
+                              "type": "string"
+                            },
+                            "value": {
+                              "type": "integer"
+                            }
+                          },
+                          "type": "object"
+                        },
+                        "value": {
+                          "items": {
+                            "properties": {
+                              "authorizationSource": {
+                                "type": "string"
+                              },
+                              "displayName": {
+                                "type": "string"
+                              },
+                              "id": {
+                                "type": "string"
+                              },
+                              "managedByTenants": {
+                                "type": "array"
+                              },
+                              "state": {
+                                "type": "string"
+                              },
+                              "subscriptionId": {
+                                "type": "string"
+                              },
+                              "subscriptionPolicies": {
+                                "properties": {
+                                  "locationPlacementId": {
+                                    "type": "string"
+                                  },
+                                  "quotaId": {
+                                    "type": "string"
+                                  },
+                                  "spendingLimit": {
+                                    "type": "string"
+                                  }
+                                },
+                                "type": "object"
+                              },
+                              "tenantId": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "id",
+                              "authorizationSource",
+                              "managedByTenants",
+                              "subscriptionId",
+                              "tenantId",
+                              "displayName",
+                              "state",
+                              "subscriptionPolicies"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "headers": {
+                      "properties": {
+                        "Cache-Control": {
+                          "type": "string"
+                        },
+                        "Content-Length": {
+                          "type": "string"
+                        },
+                        "Content-Type": {
+                          "type": "string"
+                        },
+                        "Date": {
+                          "type": "string"
+                        },
+                        "Expires": {
+                          "type": "string"
+                        },
+                        "Pragma": {
+                          "type": "string"
+                        },
+                        "Strict-Transport-Security": {
+                          "type": "string"
+                        },
+                        "Vary": {
+                          "type": "string"
+                        },
+                        "X-Content-Type-Options": {
+                          "type": "string"
+                        },
+                        "x-ms-correlation-request-id": {
+                          "type": "string"
+                        },
+                        "x-ms-ratelimit-remaining-tenant-reads": {
+                          "type": "string"
+                        },
+                        "x-ms-request-id": {
+                          "type": "string"
+                        },
+                        "x-ms-routing-request-id": {
+                          "type": "string"
+                        }
+                      },
+                      "type": "object"
+                    },
+                    "statusCode": {
+                      "type": "integer"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "outputs": {}
+        },
+        "parameters": {
+          "$connections": {
+            "value": {
+              "azuretables": {
+                "id": "[concat('/subscriptions/',subscription().subscriptionId,'/providers/Microsoft.Web/locations/',variables('logic_app_location'),'/managedApis/azuretables')]",
+                "connectionId": "[resourceId('Microsoft.Web/connections', variables('azuretables_connection_name'))]",
+                "connectionName": "[variables('azuretables_connection_name')]"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Web/connections",
+      "apiVersion": "2016-06-01",
+      "location": "[variables('logic_app_location')]",
+      "name": "[variables('azuretables_connection_name')]",
+      "properties": {
+        "api": {
+          "id": "[concat('/subscriptions/',subscription().subscriptionId,'/providers/Microsoft.Web/locations/',variables('logic_app_location'),'/managedApis/azuretables')]"
+        },
+        "displayName": "[variables('azuretables_connection_name')]",
+        "parameterValues": {
+          "storageaccount": "[parameters('storageaccount')]",
+          "sharedkey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', parameters('storageaccount')), '2018-02-01').keys[0].value]"
+        }
+      }
+    },
+    {
+      "name": "[parameters('storageaccount')]",
+      "type": "Microsoft.Storage/storageAccounts",
+      "location": "[resourceGroup().location]",
+      "apiVersion": "2018-07-01",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "dependsOn": [],
+      "tags": {
+        "displayName": "[parameters('storageaccount')]"
+      },
+      "kind": "StorageV2"
+    }
+  ],
+  "outputs": {}
+}
